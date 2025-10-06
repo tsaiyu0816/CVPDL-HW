@@ -1,0 +1,4 @@
+data/
+runs/
+ultralytics/
+yolo11n.pt
