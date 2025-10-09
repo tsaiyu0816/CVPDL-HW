@@ -1,4 +1,9 @@
 data/
 runs/
+pre_result/
 ultralytics/
 yolo11n.pt
+weight/
+weight-1/
+
+*y11x_cls_backbone_v1*

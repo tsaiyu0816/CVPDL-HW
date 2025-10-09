@@ -1,16 +1,23 @@
 # inference.py
 """
-用訓練好的權重在 data/test/images 做推論，輸出 submission.csv
-格式：Image_ID,PredictionString
-PredictionString = "score x y w h cls ..." 以空白分隔，多個框串起來
-座標單位：像素，(x,y) 為左上角，(w,h) 為寬高；cls 固定 0（只有「豬」一類）
+多權重（multi-seed / multi-run）+ 多尺度 + HFlip 的 WBF 推論器
+- 支援一次丟入多個 .pt 權重（逗號/空白分隔、萬用字元、或資料夾自動搜 *.pt）
+- 針對每張影像，對每個模型跑：
+    * 原圖
+    * （可選）HFlip
+    * （可選）多尺度 imgsz 列表
+  然後把所有路徑的框丟進 WBF 融合，最後再做 final_conf/Top-K 過濾。
+- 輸出 submission.csv（Image_ID, PredictionString），格式同你原本規格：
+  "score x y w h cls ..."，座標像素，cls 固定 0（只有「豬」一類）
 """
 from pathlib import Path
 import argparse
-from typing import List, Tuple
+from typing import List, Tuple, Sequence
 import numpy as np
 import pandas as pd
 import cv2
+import glob
+import re
 
 from ultralytics import YOLO
 from utils import read_image_hw, xyxy_to_tlwh, clamp_box, format_pred_line, natural_int
@@ -67,8 +74,50 @@ def _from_norm_xyxy(xyxy: np.ndarray, W: int, H: int) -> np.ndarray:
     return out
 
 
-def run_single_wbf(
-    model: YOLO,
+def _expand_weights_arg(weights_arg: str) -> List[Path]:
+    """
+    解析 --weights：
+      - 逗號或空白分隔的多個路徑/萬用字元
+      - 若為資料夾，自動尋找底下的 *.pt / *.pth
+      - 若為萬用字元（含 * ?），以 glob 展開
+    回傳不重複、存在的檔案路徑（保持出現順序）
+    """
+    if not weights_arg:
+        return []
+    tokens = [t for t in re.split(r"[,\s]+", weights_arg) if t.strip()]
+    seen = set()
+    out: List[Path] = []
+    for tok in tokens:
+        tok = tok.strip()
+        paths: List[str] = []
+        p = Path(tok)
+        if any(ch in tok for ch in "*?[]"):
+            paths = glob.glob(tok, recursive=True)
+        elif p.is_dir():
+            paths = glob.glob(str(p / "**" / "*.pt"), recursive=True) + \
+                    glob.glob(str(p / "**" / "*.pth"), recursive=True)
+        elif p.is_file():
+            paths = [str(p)]
+        else:
+            # 嘗試當作資料夾下通配
+            paths = glob.glob(str(p / "**" / "*.pt"), recursive=True) + \
+                    glob.glob(str(p / "**" / "*.pth"), recursive=True)
+        for s in sorted(set(paths)):
+            ps = Path(s)
+            try:
+                rp = ps.resolve()
+            except Exception:
+                rp = ps
+            if rp.exists() and rp.suffix.lower() in [".pt", ".pth"]:
+                key = str(rp)
+                if key not in seen:
+                    seen.add(key)
+                    out.append(rp)
+    return out
+
+
+def run_single_wbf_ensemble(
+    models: Sequence[YOLO],
     img_path: Path,
     imgsz: int,
     conf: float,
@@ -81,42 +130,40 @@ def run_single_wbf(
     wbf_conf_type: str,
 ):
     """
-    針對單張影像：
-      - 原圖推論
-      - 可選：水平翻轉推論（再映回）
-      - 可選：多尺度推論（改 imgsz）
-      - 用 WBF 融合上述多路輸出
+    針對單張影像，對「多個模型 × (原圖 + 可選 HFlip + 可選多尺度)」做推論，最後用 WBF 融合。
     """
     try:
         from ensemble_boxes import weighted_boxes_fusion
     except Exception as e:
         raise RuntimeError("需要套件 ensemble-boxes：請先 `pip install ensemble-boxes`") from e
 
+    # 讀圖尺寸；HFlip 會需要影像內容
     W, H = read_image_hw(img_path)
+    img_bgr = cv2.imread(str(img_path), cv2.IMREAD_COLOR)  # 供 HFlip 用
+    img_flip = cv2.flip(img_bgr, 1) if (use_hflip and img_bgr is not None) else None
 
     boxes_list, scores_list, labels_list = [], [], []
 
-    # 1) 原圖
-    res0 = model.predict(
-        source=str(img_path),
-        imgsz=imgsz,
-        conf=conf,
-        iou=iou_pred,
-        device=device,
-        max_det=max_det,
-        augment=False,
-        verbose=False,
-    )[0]
-    xyxy0, sc0, cl0 = _collect_xyxy_scores_cls(res0)
-    boxes_list.append(sanitize_and_norm_xyxy(xyxy0, W, H).tolist())
-    scores_list.append(sc0.tolist())
-    labels_list.append(cl0.tolist())
+    # 對每個模型執行
+    for model in models:
+        # 1) 原圖
+        res0 = model.predict(
+            source=str(img_path),
+            imgsz=imgsz,
+            conf=conf,
+            iou=iou_pred,
+            device=device,
+            max_det=max_det,
+            augment=False,
+            verbose=False,
+        )[0]
+        xyxy0, sc0, cl0 = _collect_xyxy_scores_cls(res0)
+        boxes_list.append(sanitize_and_norm_xyxy(xyxy0, W, H).tolist())
+        scores_list.append(sc0.tolist())
+        labels_list.append(cl0.tolist())
 
-    # 2) 水平翻轉
-    if use_hflip:
-        img = cv2.imread(str(img_path), cv2.IMREAD_COLOR)  # BGR
-        if img is not None:
-            img_flip = cv2.flip(img, 1)
+        # 2) HFlip
+        if img_flip is not None:
             resf = model.predict(
                 source=img_flip,
                 imgsz=imgsz,
@@ -128,42 +175,42 @@ def run_single_wbf(
                 verbose=False,
             )[0]
             xyxyf, scf, clf = _collect_xyxy_scores_cls(resf)
-            xyxyf = _xyxy_hflip(xyxyf, W)  # 映回原圖座標
+            xyxyf = _xyxy_hflip(xyxyf, W)
             boxes_list.append(sanitize_and_norm_xyxy(xyxyf, W, H).tolist())
             scores_list.append(scf.tolist())
             labels_list.append(clf.tolist())
 
-    # 3) 多尺度
-    for s in scale_list:
-        if s == imgsz:
-            continue
-        res_s = model.predict(
-            source=str(img_path),
-            imgsz=s,
-            conf=conf,
-            iou=iou_pred,
-            device=device,
-            max_det=max_det,
-            augment=False,
-            verbose=False,
-        )[0]
-        xyxys, scs, cls_ = _collect_xyxy_scores_cls(res_s)
-        boxes_list.append(sanitize_and_norm_xyxy(xyxys, W, H).tolist())
-        scores_list.append(scs.tolist())
-        labels_list.append(cls_.tolist())
+        # 3) 多尺度
+        for s in scale_list:
+            if s == imgsz:
+                continue
+            res_s = model.predict(
+                source=str(img_path),
+                imgsz=s,
+                conf=conf,
+                iou=iou_pred,
+                device=device,
+                max_det=max_det,
+                augment=False,
+                verbose=False,
+            )[0]
+            xyxys, scs, cls_ = _collect_xyxy_scores_cls(res_s)
+            boxes_list.append(sanitize_and_norm_xyxy(xyxys, W, H).tolist())
+            scores_list.append(scs.tolist())
+            labels_list.append(cls_.tolist())
 
     # 若完全沒框
     if sum(len(b) for b in boxes_list) == 0:
         return np.zeros((0, 4), dtype=float), np.zeros((0,), dtype=float), np.zeros((0,), dtype=int)
 
-    # 4) WBF
+    # 4) WBF 融合
     wbf_boxes, wbf_scores, wbf_labels = weighted_boxes_fusion(
         boxes_list,
         scores_list,
         labels_list,
-        iou_thr=wbf_iou,          # WBF 用的 IoU
+        iou_thr=wbf_iou,
         skip_box_thr=conf,        # 進入 WBF 的分數門檻
-        conf_type=wbf_conf_type,  # "max" 比較穩
+        conf_type=wbf_conf_type,  # "max" 對集成較穩
         allows_overflow=False,
     )
 
@@ -187,55 +234,91 @@ def run_single_wbf(
 
 def parse_args():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--weights", default="runs/pig/yolov8s-baseline/weights/best.pt", type=str)
+    # ✅ 現在 --weights 支援：逗號/空白分隔、萬用字元、或資料夾（自動找 *.pt）
+    ap.add_argument(
+        "--weights",
+        default="runs/pig/y11x_s*/weights/best.pt",
+        type=str,
+        help="多個模型權重：用逗號或空白分隔，或用萬用字元，或給資料夾（自動遞迴找 *.pt）",
+    )
     ap.add_argument("--test_dir", default="data/test/images", type=str)
     ap.add_argument("--out_csv", default="submission.csv", type=str)
-    ap.add_argument("--imgsz", default=640, type=int)
-    ap.add_argument("--conf", default=0.4, type=float)  # 預測與 WBF 入口閥值
-    ap.add_argument("--iou", default=0.65, type=float)  # Ultralytics NMS IoU
-    ap.add_argument("--device", default=0, type=str)
+    ap.add_argument("--imgsz", default=960, type=int)
+    ap.add_argument("--conf", default=0.18, type=float, help="Ultralytics 預測與 WBF 入口分數門檻")
+    ap.add_argument("--iou", default=0.65, type=float, help="Ultralytics NMS IoU")
+    ap.add_argument("--device", default="0", type=str)
     ap.add_argument("--max_det", default=300, type=int)
 
-    # 內建 TTA（非 WBF）
+    # 內建 TTA（非 WBF）：只在 --wbf 未啟用時才會用到
     ap.add_argument("--tta", action="store_true", help="Ultralytics 內建 TTA（非 WBF）")
 
     # WBF 相關
-    ap.add_argument("--wbf", action="store_true", help="啟用 WBF（會改用自訂 TTA 流程）")
+    ap.add_argument("--wbf", action="store_true", help="啟用 WBF（會改用自訂 TTA/集成流程）")
     ap.add_argument("--wbf_hflip", action="store_true", help="WBF 時加水平翻轉 TTA")
-    ap.add_argument("--wbf_scales", type=str, default="1.0",
-                    help="WBF 的多尺度倍率，逗號分隔，例如 '0.95,1.0'；會乘上 --imgsz 取整，下限 320")
+    ap.add_argument(
+        "--wbf_scales",
+        type=str,
+        default="1.10,1.0,0.90",
+        help="WBF 的多尺度倍率，逗號分隔，例如 '1.10,1.0,0.90'；會乘上 --imgsz 取整，下限 320",
+    )
     ap.add_argument("--wbf_iou", type=float, default=0.60, help="WBF 內部 IoU 門檻")
     ap.add_argument("--wbf_conf_type", type=str, default="max", choices=["avg", "max"])
 
     # 最終輸出前的過濾
-    ap.add_argument("--final_conf", type=float, default=None,
-                    help="寫入 CSV 前的最終分數門檻；未指定則沿用 --conf")
+    ap.add_argument(
+        "--final_conf",
+        type=float,
+        default=0.10,
+        help="寫入 CSV 前的最終分數門檻；未指定則沿用 --conf",
+    )
     ap.add_argument("--topk", type=int, default=300, help="每張圖最多保留的框數（CSV 前截斷）")
     return ap.parse_args()
+
+
+def _make_models(weight_paths: List[Path]) -> List[YOLO]:
+    if not weight_paths:
+        raise FileNotFoundError("找不到任何可用的權重檔（請檢查 --weights 參數）")
+    models: List[YOLO] = []
+    print("[INFO] 將載入以下權重做集成：")
+    for p in weight_paths:
+        print("   -", str(p))
+        models.append(YOLO(str(p)))
+    return models
 
 
 def main():
     args = parse_args()
 
+    # 解析測試影像列表
     test_dir = Path(args.test_dir)
     img_paths = [p for p in test_dir.iterdir()
                  if p.suffix.lower() in [".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"]]
-    # 依數字 id 排序（避免評測順序問題）
     img_paths.sort(key=lambda p: (natural_int(p.stem) is None, natural_int(p.stem), p.stem))
 
-    model = YOLO(args.weights)
+    # 展開多權重並載入模型
+    weight_paths = _expand_weights_arg(args.weights)
+    models = _make_models(weight_paths)
 
     # 解析 WBF 多尺度
     try:
         ratios = [float(s.strip()) for s in args.wbf_scales.split(",")]
     except Exception:
         ratios = [1.0]
+
+    # 以各模型的 stride 取最大值，確保符合所有模型的 stride 對齊
     stride = 32
     try:
-        stride = int(max(model.model.stride).item())
+        strides = []
+        for m in models:
+            try:
+                s = int(max(m.model.stride).item())
+                strides.append(s)
+            except Exception:
+                pass
+        if strides:
+            stride = max(strides)
     except Exception:
         pass
-
 
     scale_list = []
     for r in ratios:
@@ -251,8 +334,8 @@ def main():
         W, H = read_image_hw(img_path)
 
         if args.wbf:
-            xyxy, confs, clss = run_single_wbf(
-                model=model,
+            xyxy, confs, clss = run_single_wbf_ensemble(
+                models=models,
                 img_path=img_path,
                 imgsz=args.imgsz,
                 conf=args.conf,
@@ -265,8 +348,8 @@ def main():
                 wbf_conf_type=args.wbf_conf_type,
             )
         else:
-            # 原本的單路推論（可選內建 TTA，但非 WBF）
-            res = model.predict(
+            # 非 WBF：只用第一個模型，可選 Ultralytics 內建 TTA
+            res = models[0].predict(
                 source=str(img_path),
                 imgsz=args.imgsz,
                 conf=args.conf,
