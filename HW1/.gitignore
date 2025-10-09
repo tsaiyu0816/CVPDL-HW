@@ -3,5 +3,4 @@ runs-1/
 pre_result/
 ultralytics/
 weights/
- 
-                        
+*.pt
