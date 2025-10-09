@@ -1,5 +1,6 @@
 data/
 runs-1/
+runs/
 pre_result/
 ultralytics/
 weights/
