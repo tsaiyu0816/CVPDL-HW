@@ -4,4 +4,7 @@ runs/
 pre_result/
 ultralytics/
 weights/
+*.ptruns/
 *.pt
+*.pth
+submission_*.csv
