@@ -1,15 +1,7 @@
 data/
-runs/
+runs-1/
 pre_result/
 ultralytics/
-yolo11n.pt
 weights/
-weights-1/
-
-!**/*y11x_cls_backbone_v1* 
-!**/*y11x_cls_backbone_v1* 
+ 
                         
-!runs/                          
-!runs/**/                      
-!runs/**/y11x_cls_backbone_v1*  
-!runs/**/y11x_cls_backbone_v1*/ 
