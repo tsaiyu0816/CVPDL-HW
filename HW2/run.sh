@@ -24,42 +24,41 @@ python dataload.py \
   --names "car,hov,person,motorcycle" \
   --workers 12 \
   --val_ratio 0.10 --val_seed 2025 --skip_val_if_exists 1 --valsync 1 \
-  --make_chips --chip_size 1024 --chips_per_img 1 --chip_jitter 0.15 \
+  --make_chips --chip_size 1024 --chips_per_img 0 --chip_jitter 0.15 \
   --chip_min_area 4 --chip_format jpg --jpg_quality 90 --clear_old_chips 1
 
 # ------------------------------
 # 2) 單階段訓練（原生 YOLO 參數；只把 imgsz 拉到 1792）
 # ------------------------------
-MODEL="models/yolo11s.yaml"
-RUN="2-y11s"
+MODEL="models/yolo11s-p2.yaml"
+RUN="1-y11s-p2"
 SEED=2025
 
 python train.py \
   --data data/hw2_fold0.yaml \
   --model "$MODEL" \
-  --imgsz 1792 \
-  --epochs 130 \
-  --batch 3 \
+  --imgsz 1920 \
+  --epochs 150 \
+  --batch 2 \
   --project runs/hw2 --name "$RUN" \
-  --device 0 --seed "$SEED" --workers 12
+  --device 0 --seed "$SEED" --workers 8
 
 # ------------------------------
 # 3) 推論（slice 同步拉到 1792）
 # ------------------------------
 FINAL="runs/hw2/${RUN}/weights/best.pt"; [ -f "$FINAL" ] || FINAL="runs/hw2/${RUN}/weights/last.pt"
-CONF_STR="0:0.05,1:0.03,2:0.03,3:0.03"
+CONF_STR="0:0.10,1:0.05,2:0.06,3:0.07"
 
-# 3b) test → submission
 python inference.py \
+  --mode full \
   --weights "$FINAL" \
   --test_dir data/hw2_yolo/images/test \
+  --imgsz 1920 \
   --conf 0.05 \
-  --slice 1792 --overlap 0.32 \
-  --tta_hflip --tta_scales 1.0 \
-  --wbf --wbf_iou 0.45 \
+  --iou 0.70 \
   --per_class_conf "$CONF_STR" \
-  --out_csv submission_sp2_1.csv \
+  --out_csv submission.csv \
   --save_details \
-  --viz_dir out_vis --viz_every 20 --viz_limit 120
+  --viz_dir out_vis --viz_every 15 --viz_limit 60
 
 echo "[✓] Done. submission_s_2.csv 已產生。"
