@@ -1,0 +1,7 @@
+data/
+Results/
+runs/
+trash/
+test_inference.sh
+eval_dets.py
+

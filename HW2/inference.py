@@ -9,13 +9,12 @@ import pandas as pd
 import cv2
 import torch
 
-# 可選：SAHI（僅在 --mode sahi 時才用到）
+# SAHI（僅在 --mode sahi 時才用到）
 from sahi.predict import get_sliced_prediction
 from sahi.models.ultralytics import UltralyticsDetectionModel
 
 # Ultralytics
 from ultralytics import YOLO
-
 
 # ---------------- Basics ----------------
 def parse_pc_conf(s: str):
@@ -30,6 +29,15 @@ def parse_pc_conf(s: str):
         k, v = kv.split(":")
         out[int(k)] = float(v)
     return out
+
+def parse_weights_arg(w):
+    """支援：--weights 'a.pt,b.pt' 或多次 --weights a.pt --weights b.pt"""
+    if isinstance(w, (list, tuple)):
+        items = []
+        for t in w:
+            items += [x.strip() for x in str(t).split(",") if x.strip()]
+        return items
+    return [x.strip() for x in str(w).split(",") if x.strip()]
 
 def iou_xywh(a, b):
     ax, ay, aw, ah = a
@@ -72,7 +80,6 @@ def wbf_merge(boxes: List[Tuple[float, float, float, float]],
         out_scores.append(float(np.mean([scores[k] for k in grp_idx])))
     return out_boxes, out_scores
 
-
 # ----------- Visualization -----------
 def _color_for(c:int):
     rng = np.random.default_rng(seed=12345 + int(c))
@@ -99,7 +106,6 @@ def draw_boxes(img, items, class_names=None, thickness=2):
         cv2.putText(out, label, (tx + 3, ty - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
     return out
 
-
 # ----------- Helpers for TTA -----------
 def flip_boxes_h(items, W):
     out = []
@@ -115,7 +121,6 @@ def scale_boxes(items, scale):
     for (x, y, w, h), s, c in items:
         out.append(((x * inv, y * inv, w * inv, h * inv), s, c))
     return out
-
 
 # ----------- SAHI -----------
 def run_sahi_on_image(image, det_model, slice_size, overlap,
@@ -157,7 +162,6 @@ def run_sahi_on_image(image, det_model, slice_size, overlap,
             out.append(((float(x1), float(y1), float(w), float(h)), float(s), int(c)))
     return out
 
-
 # ----------- FULL-image predictor -----------
 def yolov8_predict_full(model: YOLO, img: np.ndarray, imgsz: int, conf: float, iou: float, device, max_det: int):
     """
@@ -181,13 +185,13 @@ def yolov8_predict_full(model: YOLO, img: np.ndarray, imgsz: int, conf: float, i
             out.append(((float(x1), float(y1), float(w), float(h)), float(s), int(c)))
     return out
 
-
 # ----------------- Main -----------------
 def main():
-    ap = argparse.ArgumentParser("Unified inference (full-image & SAHI)")
+    ap = argparse.ArgumentParser("Unified inference (multi-weight ensemble + full-image & SAHI)")
     ap.add_argument("--mode", choices=["full","sahi"], default="full",
                     help="full=整圖（和 val 一致的 baseline）；sahi=切片融合")
-    ap.add_argument("--weights", required=True)
+    ap.add_argument("--weights", required=True, nargs="+",
+                    help="一個或多個模型路徑；可用逗號分隔或重複提供多次")
     ap.add_argument("--test_dir", required=True)
 
     # 通用/寫檔
@@ -223,6 +227,12 @@ def main():
 
     args = ap.parse_args()
 
+    # 解析多權重
+    weight_list = parse_weights_arg(args.weights)
+    if len(weight_list) > 1 and not args.wbf:
+        print(f"[ens] detected {len(weight_list)} weights -> enabling WBF by default")
+        args.wbf = True
+
     # 準備資料集
     test_dir = Path(args.test_dir)
     img_paths = sorted([
@@ -241,36 +251,45 @@ def main():
     if viz_dir:
         viz_dir.mkdir(parents=True, exist_ok=True)
 
-    # 準備模型
+    # 準備模型（支援多權重）
     if args.mode == "full":
-        model = YOLO(args.weights)
-        names = model.model.names if hasattr(model, "model") else (model.names if hasattr(model, "names") else None)
+        models = [YOLO(w) for w in weight_list]
+        # 類別名（假設各模型一致）
+        names = None
+        if hasattr(models[0], "model"):
+            names = models[0].model.names
+        elif hasattr(models[0], "names"):
+            names = models[0].names
         device = args.device
+        print(f"[ens] full-image mode with {len(models)} models.")
     else:
-        # SAHI
-        det = UltralyticsDetectionModel(
-            model_path=args.weights,
-            confidence_threshold=min(args.conf, 0.07),
-            device=("cuda:0" if torch.cuda.is_available() and "cuda" in str(args.device).lower() else (args.device if "cpu" in str(args.device).lower() else "cpu"))
-        )
-        # 建立一次 predictor
-        try:
-            dummy = np.zeros((max(32, args.slice), max(32, args.slice), 3), dtype=np.uint8)
-            _ = det.model.predict(source=dummy, imgsz=args.slice, conf=0.01, verbose=False,
-                                  device=(0 if "cuda" in str(args.device).lower() and torch.cuda.is_available() else "cpu"))
-            o = det.model.overrides
-            o["device"] = (0 if "cuda" in str(args.device).lower() and torch.cuda.is_available() else "cpu")
-            o["half"] = True if torch.cuda.is_available() and "cuda" in str(args.device).lower() else False
-            o["max_det"] = max(1000, args.max_det)
-            o["iou"] = min(max(args.iou, 0.05), 0.95)  # 用於 predictor 的內部 NMS（仍建議讓 SAHI 主導融合）
-            o["agnostic_nms"] = False
-            o["imgsz"] = int(args.slice)
-        except Exception as e:
-            print(f"[Warn] override error: {e}")
+        det_models = []
+        for w in weight_list:
+            det = UltralyticsDetectionModel(
+                model_path=w,
+                confidence_threshold=min(args.conf, 0.07),
+                device=("cuda:0" if torch.cuda.is_available() and "cuda" in str(args.device).lower()
+                        else (args.device if "cpu" in str(args.device).lower() else "cpu"))
+            )
+            try:
+                dummy = np.zeros((max(32, args.slice), max(32, args.slice), 3), dtype=np.uint8)
+                _ = det.model.predict(source=dummy, imgsz=args.slice, conf=0.01, verbose=False,
+                                      device=(0 if "cuda" in str(args.device).lower() and torch.cuda.is_available() else "cpu"))
+                o = det.model.overrides
+                o["device"] = (0 if "cuda" in str(args.device).lower() and torch.cuda.is_available() else "cpu")
+                o["half"] = True if torch.cuda.is_available() and "cuda" in str(args.device).lower() else False
+                o["max_det"] = max(1000, args.max_det)
+                o["iou"] = min(max(args.iou, 0.05), 0.95)
+                o["agnostic_nms"] = False
+                o["imgsz"] = int(args.slice)
+            except Exception as e:
+                print(f"[Warn] override error on {w}: {e}")
+            det_models.append(det)
         # 類別名
         names = None
+        base = det_models[0]
         for chain in (["names"], ["model","names"], ["model","model","names"]):
-            obj = det
+            obj = base
             try:
                 for a in chain:
                     obj = getattr(obj, a)
@@ -288,6 +307,7 @@ def main():
             names = [str(x) for x in names]
         else:
             names = None
+        print(f"[ens] SAHI mode with {len(det_models)} models.")
 
     # 蒐集輸出
     rows_submission, rows_details = [], []
@@ -312,49 +332,41 @@ def main():
 
         if args.mode == "full":
             for s in scales:
-                if abs(s - 1.0) < 1e-6:
-                    im_s = im
-                else:
-                    im_s = cv2.resize(im, (int(W * s), int(H * s)), interpolation=cv2.INTER_LINEAR)
-                r1 = yolov8_predict_full(
-                    model=model, img=im_s, imgsz=args.imgsz,
-                    conf=min(args.conf, 0.99), iou=args.iou, device=args.device, max_det=args.max_det
-                )
-                r1 = scale_boxes(r1, s)  # map 回原圖比例
-                preds.extend(r1)
-
-                if args.tta_hflip:
-                    im_f = cv2.flip(im_s, 1)
-                    r2 = yolov8_predict_full(
-                        model=model, img=im_f, imgsz=args.imgsz,
+                im_s = im if abs(s - 1.0) < 1e-6 else cv2.resize(im, (int(W * s), int(H * s)), interpolation=cv2.INTER_LINEAR)
+                # 逐模型跑一次
+                for m in models:
+                    r1 = yolov8_predict_full(
+                        model=m, img=im_s, imgsz=args.imgsz,
                         conf=min(args.conf, 0.99), iou=args.iou, device=args.device, max_det=args.max_det
                     )
-                    r2 = flip_boxes_h(r2, im_s.shape[1])
-                    r2 = scale_boxes(r2, s)
-                    preds.extend(r2)
-
-        else:  # SAHI
-            for s in scales:
-                if abs(s - 1.0) < 1e-6:
-                    im_s = im
-                else:
-                    im_s = cv2.resize(im, (int(W * s), int(H * s)), interpolation=cv2.INTER_LINEAR)
-                r1 = run_sahi_on_image(
-                    im_s, det, args.slice, args.overlap,
-                    post_type=args.post_type, match_thr=args.post_match_thr
-                )
-                r1 = scale_boxes(r1, s)
-                preds.extend(r1)
-
+                    preds.extend(scale_boxes(r1, s))
                 if args.tta_hflip:
                     im_f = cv2.flip(im_s, 1)
-                    rf = run_sahi_on_image(
-                        im_f, det, args.slice, args.overlap,
+                    for m in models:
+                        r2 = yolov8_predict_full(
+                            model=m, img=im_f, imgsz=args.imgsz,
+                            conf=min(args.conf, 0.99), iou=args.iou, device=args.device, max_det=args.max_det
+                        )
+                        r2 = flip_boxes_h(r2, im_s.shape[1])
+                        preds.extend(scale_boxes(r2, s))
+        else:  # SAHI
+            for s in scales:
+                im_s = im if abs(s - 1.0) < 1e-6 else cv2.resize(im, (int(W * s), int(H * s)), interpolation=cv2.INTER_LINEAR)
+                for det in det_models:
+                    r1 = run_sahi_on_image(
+                        im_s, det, args.slice, args.overlap,
                         post_type=args.post_type, match_thr=args.post_match_thr
                     )
-                    rf = flip_boxes_h(rf, im_s.shape[1])
-                    rf = scale_boxes(rf, s)
-                    preds.extend(rf)
+                    preds.extend(scale_boxes(r1, s))
+                if args.tta_hflip:
+                    im_f = cv2.flip(im_s, 1)
+                    for det in det_models:
+                        rf = run_sahi_on_image(
+                            im_f, det, args.slice, args.overlap,
+                            post_type=args.post_type, match_thr=args.post_match_thr
+                        )
+                        rf = flip_boxes_h(rf, im_s.shape[1])
+                        preds.extend(scale_boxes(rf, s))
 
         # 輕量預過濾
         pre_min_conf = max(0.00, min(args.conf, 0.15))
@@ -462,7 +474,6 @@ def main():
     print("[✓] wrote", stat_path)
     print("---- Summary ----")
     print("\n".join(stat_lines))
-
 
 if __name__ == "__main__":
     main()
