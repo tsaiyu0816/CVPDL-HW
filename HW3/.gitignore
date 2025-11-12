@@ -1,4 +1,7 @@
 mnist/
 __pycache__/
 gen_imgs/
+gen_imgs_1/
 img_R13942126.zip
+img_R13942126_1.zip
+mnist.npz
