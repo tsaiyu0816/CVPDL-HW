@@ -1,0 +1,5 @@
+torch
+torchvision
+tqdm
+pillow
+pytorch-fid
