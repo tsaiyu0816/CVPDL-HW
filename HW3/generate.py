@@ -79,8 +79,8 @@ def main():
             snaps = ddpm.sample_with_checkpoints(n=8, checkpoints=7)
         from torchvision.utils import save_image  # 僅這裡用一下
         grid = GaussianDiffusion.make_report_grid(snaps)  # [3,H,W] in [0,1]
-        save_image(grid, out_dir / "diffusion_grid.png")
-        print(f"[OK] saved diffusion grid -> {out_dir/'diffusion_grid.png'}")
+        save_image(grid, "diffusion_grid.png")
+        print(f"[OK] saved diffusion grid -> {'diffusion_grid.png'}")
 
     # -------------------- (B) generate N images --------------------
     remain = args.num
