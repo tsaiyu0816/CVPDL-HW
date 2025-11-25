@@ -19,7 +19,7 @@ pip install gdown
 
 # 下載 Google Drive 檔案（影像壓縮檔）
 gdown --id '1xVCJD6M6sE-tZJYxenLzvuEkSiYXig_F' -O mnist_images.zip
-unzip -q mnist_images.zip -d mnist_raw
+unzip -q mnist_images.zip -d mnist
 
 # 確認數量（期望約 60,000）
 ls ./mnist | wc -l
